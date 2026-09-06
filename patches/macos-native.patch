@@ -1,0 +1,562 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index b904773..798bec5 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -6047,6 +6047,7 @@ version = "0.1.0"
+ dependencies = [
+  "anyhow",
+  "async-trait",
++ "cc",
+  "clap",
+  "directories",
+  "fast_image_resize",
+diff --git a/Cargo.toml b/Cargo.toml
+index cca015d..770b1b3 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -109,3 +109,6 @@ wie-util = { workspace = true }
+ [target.'cfg(target_arch = "wasm32")'.dependencies]
+ getrandom = { version = "^0.4", features = ["wasm_js"] } # not direct dependency, but broken without it in wasm build
+ web-sys = { version = "=0.3.85" }                        # We need 0.3.85 to not break midir wasm build
++
++[build-dependencies]
++cc = "1"
+diff --git a/build.rs b/build.rs
+new file mode 100644
+index 0000000..d3664fb
+--- /dev/null
++++ b/build.rs
+@@ -0,0 +1,8 @@
++fn main() {
++    println!("cargo:rerun-if-changed=src/macos_synth.c");
++    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
++        cc::Build::new().file("src/macos_synth.c").compile("heroes_synth");
++        println!("cargo:rustc-link-lib=framework=AudioToolbox");
++        println!("cargo:rustc-link-lib=framework=AudioUnit");
++    }
++}
+diff --git a/src/app_config.rs b/src/app_config.rs
+new file mode 100644
+index 0000000..d1b2049
+--- /dev/null
++++ b/src/app_config.rs
+@@ -0,0 +1,55 @@
++use std::{
++    ffi::OsString,
++    path::{Path, PathBuf},
++};
++
++pub const TITLE: &str = "영웅서기 4 — 환영의 가면";
++
++pub fn data_dir() -> PathBuf {
++    directories::ProjectDirs::from("local", "HeroesLore", "HeroesLore4")
++        .expect("macOS user data directory must exist")
++        .data_dir()
++        .to_owned()
++}
++
++pub fn bundled_game(executable: &Path) -> Option<PathBuf> {
++    let macos = executable.parent()?;
++    if macos.file_name()? != "MacOS" {
++        return None;
++    }
++    let contents = macos.parent()?;
++    if contents.file_name()? != "Contents" {
++        return None;
++    }
++    Some(contents.join("Resources/game.zip"))
++}
++
++pub fn launch_args() -> anyhow::Result<Vec<OsString>> {
++    let mut args: Vec<_> = std::env::args_os().collect();
++    if args.len() == 1
++        && let Some(game) = bundled_game(&std::env::current_exe()?)
++    {
++        anyhow::ensure!(game.is_file(), "Bundled game data is missing: {}", game.display());
++        args.push(game.into_os_string());
++    }
++    Ok(args)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn resolves_moved_bundle_and_unicode_paths() {
++        let path = Path::new("/Applications/영웅서기 4.app/Contents/MacOS/HeroesLore4");
++        assert_eq!(
++            bundled_game(path),
++            Some(PathBuf::from("/Applications/영웅서기 4.app/Contents/Resources/game.zip"))
++        );
++    }
++    #[test]
++    fn leaves_command_line_binary_without_default_game() {
++        assert_eq!(bundled_game(Path::new("/tmp/wie")), None);
++        assert_eq!(bundled_game(Path::new("wie")), None);
++        assert_eq!(bundled_game(Path::new("/tmp/Other/MacOS/wie")), None);
++    }
++}
+diff --git a/src/audio_sink.rs b/src/audio_sink.rs
+index 0e09bc7..5c4b5c7 100644
+--- a/src/audio_sink.rs
++++ b/src/audio_sink.rs
+@@ -1,17 +1,14 @@
+ use std::{
+     collections::{BTreeMap, BTreeSet},
+-    error::Error,
+     num::NonZero,
+     sync::{Arc, mpsc::Receiver, mpsc::RecvTimeoutError, mpsc::Sender},
+     time::{Duration, Instant},
+ };
+ 
+-use midir::{MidiOutput, MidiOutputConnection};
++use crate::midi_output::MidiConnection;
+ use rodio::{DeviceSinkBuilder, Player, buffer::SamplesBuffer, conversions::SampleTypeConverter};
+ use wie_backend::{AudioCommand, AudioEventData, AudioHandle, AudioSequence, TimedAudioEvent};
+ 
+-use crate::select_midi_output_index;
+-
+ pub struct AudioSink {
+     tx: Sender<AudioCommand>,
+ }
+@@ -62,23 +59,7 @@ impl Playback {
+ }
+ 
+ pub fn run(rx: Receiver<AudioCommand>, midi_device: Option<usize>) {
+-    let mut midi_out = match (|| {
+-        let midi_out = MidiOutput::new("wie")?;
+-        let midi_ports = midi_out.ports();
+-        let port_index = select_midi_output_index(midi_ports.len(), midi_device).ok_or_else(|| anyhow::anyhow!("No MIDI output port"))?;
+-        let out_port = &midi_ports[port_index];
+-        let port_name = midi_out.port_name(out_port).unwrap_or_else(|_| "<unknown>".to_string());
+-
+-        if let Some(requested) = midi_device
+-            && requested != port_index
+-        {
+-            tracing::warn!(requested, fallback = %port_name, "Requested MIDI output index is out of range; using default");
+-        }
+-
+-        let connection = midi_out.connect(out_port, "wie")?;
+-        tracing::info!(port = %port_name, "Using MIDI output");
+-        Ok::<_, Box<dyn Error>>(connection)
+-    })() {
++    let mut midi_out = match crate::midi_output::open(midi_device) {
+         Ok(connection) => Some(connection),
+         Err(error) => {
+             tracing::warn!(%error, "MIDI output is unavailable");
+@@ -167,7 +148,7 @@ pub fn run(rx: Receiver<AudioCommand>, midi_device: Option<usize>) {
+ }
+ 
+ fn play_event(
+-    midi_out: &mut Option<MidiOutputConnection>,
++    midi_out: &mut Option<MidiConnection>,
+     player: Option<&Player>,
+     event: &TimedAudioEvent,
+     active_notes: &mut BTreeSet<(u8, u8)>,
+@@ -221,7 +202,7 @@ fn play_event(
+     }
+ }
+ 
+-fn cleanup(midi_out: &mut Option<MidiOutputConnection>, playback: &mut Playback) {
++fn cleanup(midi_out: &mut Option<MidiConnection>, playback: &mut Playback) {
+     let Some(midi_out) = midi_out else {
+         playback.active_notes.clear();
+         playback.used_channels.clear();
+diff --git a/src/database.rs b/src/database.rs
+index aa3a581..4cf9f43 100644
+--- a/src/database.rs
++++ b/src/database.rs
+@@ -1,7 +1,5 @@
+ use std::{fs, path::PathBuf};
+ 
+-use directories::ProjectDirs;
+-
+ use wie_backend::RecordId;
+ 
+ pub struct DatabaseRepository {
+@@ -10,9 +8,7 @@ pub struct DatabaseRepository {
+ 
+ impl DatabaseRepository {
+     pub fn new() -> Self {
+-        let base_dir = ProjectDirs::from("net", "dlunch", "wie").unwrap();
+-
+-        let base_path = base_dir.data_dir().to_owned();
++        let base_path = crate::app_config::data_dir();
+ 
+         Self { base_path }
+     }
+diff --git a/src/filesystem.rs b/src/filesystem.rs
+index 708174a..17ed341 100644
+--- a/src/filesystem.rs
++++ b/src/filesystem.rs
+@@ -4,8 +4,6 @@ use std::{
+     path::{Component, Path, PathBuf},
+ };
+ 
+-use directories::ProjectDirs;
+-
+ use wie_backend::Filesystem;
+ 
+ /// Persistent filesystem backed by `std::fs` under `<base>/<aid>/fs/<path>`.
+@@ -16,10 +14,8 @@ pub struct CliFilesystem {
+ 
+ impl CliFilesystem {
+     pub fn new() -> Self {
+-        let base_dir = ProjectDirs::from("net", "dlunch", "wie").unwrap();
+-        Self {
+-            base_path: base_dir.data_dir().to_owned(),
+-        }
++        let base_path = crate::app_config::data_dir();
++        Self { base_path }
+     }
+ 
+     fn path_for(&self, aid: &str, path: &str) -> Option<PathBuf> {
+diff --git a/src/macos_synth.c b/src/macos_synth.c
+new file mode 100644
+index 0000000..204760f
+--- /dev/null
++++ b/src/macos_synth.c
+@@ -0,0 +1,53 @@
++#include <AudioToolbox/AudioToolbox.h>
++#include <stdlib.h>
++#include <CoreServices/CoreServices.h>
++
++typedef struct { AUGraph graph; AudioUnit synth; } HLSynth;
++
++void hl_synth_close(HLSynth *state) {
++    if (!state) return;
++    if (state->graph) {
++        AUGraphStop(state->graph);
++        DisposeAUGraph(state->graph);
++    }
++    free(state);
++}
++
++OSStatus hl_synth_open(HLSynth **result) {
++    HLSynth *state = calloc(1, sizeof(*state));
++    if (!state) return memFullErr;
++    AUNode synth_node, output_node;
++    AudioComponentDescription synth = { kAudioUnitType_MusicDevice,
++        kAudioUnitSubType_DLSSynth, kAudioUnitManufacturer_Apple, 0, 0 };
++    AudioComponentDescription output = { kAudioUnitType_Output,
++        kAudioUnitSubType_DefaultOutput, kAudioUnitManufacturer_Apple, 0, 0 };
++    OSStatus status = NewAUGraph(&state->graph);
++    if (status) goto fail;
++    status = AUGraphAddNode(state->graph, &synth, &synth_node);
++    if (status) goto fail;
++    status = AUGraphAddNode(state->graph, &output, &output_node);
++    if (status) goto fail;
++    status = AUGraphOpen(state->graph);
++    if (status) goto fail;
++    status = AUGraphNodeInfo(state->graph, synth_node, NULL, &state->synth);
++    if (status) goto fail;
++    status = AUGraphConnectNodeInput(state->graph, synth_node, 0, output_node, 0);
++    if (status) goto fail;
++    status = AUGraphInitialize(state->graph);
++    if (status) goto fail;
++    status = AUGraphStart(state->graph);
++    if (status) goto fail;
++    *result = state;
++    return noErr;
++fail:
++    hl_synth_close(state);
++    return status;
++}
++
++OSStatus hl_synth_send(HLSynth *state, const unsigned char *bytes, unsigned int len) {
++    if (!len) return paramErr;
++    if (bytes[0] == 0xF0) return MusicDeviceSysEx(state->synth, bytes, len);
++    if (len > 3) return paramErr;
++    return MusicDeviceMIDIEvent(state->synth, bytes[0], len > 1 ? bytes[1] : 0,
++        len > 2 ? bytes[2] : 0, 0);
++}
+diff --git a/src/main.rs b/src/main.rs
+index cffb34f..b2eb324 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,8 +1,10 @@
+ extern crate alloc;
+ 
++mod app_config;
+ mod audio_sink;
+ mod database;
+ mod filesystem;
++mod midi_output;
+ mod window;
+ 
+ use core::str;
+@@ -129,7 +131,7 @@ fn main() -> anyhow::Result<()> {
+         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+         .init();
+ 
+-    let args = Args::parse();
++    let args = Args::parse_from(app_config::launch_args()?);
+ 
+     if args.list_midi_devices {
+         return list_midi_devices();
+@@ -245,6 +247,11 @@ fn start_with_midi_device(filename: &str, options: Options, midi_device: Option<
+ 
+                 emulator.tick()?
+             }
++            WindowCallbackEvent::FocusLost => {
++                for (key, _) in key_events.drain() {
++                    emulator.handle_event(Event::Keyup(key));
++                }
++            }
+             WindowCallbackEvent::Redraw => emulator.handle_event(Event::Redraw),
+             WindowCallbackEvent::Keydown(x) => {
+                 if let Some(keycode) = convert_key(x) {
+diff --git a/src/midi_output.rs b/src/midi_output.rs
+new file mode 100644
+index 0000000..258394d
+--- /dev/null
++++ b/src/midi_output.rs
+@@ -0,0 +1,65 @@
++use midir::{MidiOutput, MidiOutputConnection};
++
++pub enum MidiConnection {
++    External(MidiOutputConnection),
++    #[cfg(target_os = "macos")]
++    Builtin(macos::Synth),
++}
++
++impl MidiConnection {
++    pub fn send(&mut self, data: &[u8]) -> anyhow::Result<()> {
++        match self {
++            Self::External(connection) => connection.send(data).map_err(|e| anyhow::anyhow!(e.to_string())),
++            #[cfg(target_os = "macos")]
++            Self::Builtin(synth) => synth.send(data),
++        }
++    }
++}
++
++pub fn open(requested: Option<usize>) -> anyhow::Result<MidiConnection> {
++    #[cfg(target_os = "macos")]
++    if requested.is_none() {
++        let synth = macos::Synth::new()?;
++        tracing::info!("Using macOS built-in DLS synthesizer");
++        return Ok(MidiConnection::Builtin(synth));
++    }
++    let midi = MidiOutput::new("HeroesLore4")?;
++    let ports = midi.ports();
++    let index = crate::select_midi_output_index(ports.len(), requested).ok_or_else(|| anyhow::anyhow!("No MIDI output port"))?;
++    let connection = midi.connect(&ports[index], "HeroesLore4").map_err(|e| anyhow::anyhow!(e.to_string()))?;
++    Ok(MidiConnection::External(connection))
++}
++
++#[cfg(target_os = "macos")]
++mod macos {
++    use std::{ffi::c_void, ptr::NonNull};
++    unsafe extern "C" {
++        fn hl_synth_open(result: *mut *mut c_void) -> i32;
++        fn hl_synth_close(state: *mut c_void);
++        fn hl_synth_send(state: *mut c_void, bytes: *const u8, len: u32) -> i32;
++    }
++    pub struct Synth(NonNull<c_void>);
++    impl Synth {
++        pub fn new() -> anyhow::Result<Self> {
++            let mut ptr = std::ptr::null_mut();
++            // The C constructor transfers ownership only after successful initialization.
++            let status = unsafe { hl_synth_open(&mut ptr) };
++            anyhow::ensure!(status == 0, "macOS synthesizer initialization failed: {status}");
++            Ok(Self(NonNull::new(ptr).ok_or_else(|| anyhow::anyhow!("Synthesizer returned null"))?))
++        }
++        pub fn send(&mut self, data: &[u8]) -> anyhow::Result<()> {
++            anyhow::ensure!(!data.is_empty(), "Empty MIDI message");
++            let len = u32::try_from(data.len())?;
++            // Both buffers remain valid for the synchronous C call.
++            let status = unsafe { hl_synth_send(self.0.as_ptr(), data.as_ptr(), len) };
++            anyhow::ensure!(status == 0, "macOS MIDI event failed: {status}");
++            Ok(())
++        }
++    }
++    impl Drop for Synth {
++        fn drop(&mut self) {
++            // This is the unique owner of the graph allocated by hl_synth_open.
++            unsafe { hl_synth_close(self.0.as_ptr()) };
++        }
++    }
++}
+diff --git a/src/window.rs b/src/window.rs
+index 83bca2e..efc6a38 100644
+--- a/src/window.rs
++++ b/src/window.rs
+@@ -53,6 +53,7 @@ pub enum WindowCallbackEvent {
+     Redraw,
+     Keydown(PhysicalKey),
+     Keyup(PhysicalKey),
++    FocusLost,
+ }
+ 
+ pub struct WindowHandle {
+@@ -321,6 +322,9 @@ where
+ 
+     /// Updates the scaled content image surface's size.
+     fn on_resize(&mut self) {
++        if self.window_size.width == 0 || self.window_size.height == 0 {
++            return;
++        }
+         tracing::info!(
+             "on_resize scale=(native {}, actual {}), content={:?}, scaled={:?}, window={:?}",
+             self.native_scale_factor,
+@@ -335,7 +339,7 @@ where
+                 self.surface.as_mut().unwrap()
+             }
+             Some(surface) => {
+-                let desired_len = self.scaled_size.width * self.scaled_size.height;
++                let desired_len = self.window_size.width * self.window_size.height;
+                 if surface.buffer_mut().unwrap().len() == desired_len as usize {
+                     // nothing to do
+                     return;
+@@ -346,8 +350,8 @@ where
+ 
+         surface
+             .resize(
+-                NonZeroU32::new(self.scaled_size.width).unwrap(),
+-                NonZeroU32::new(self.scaled_size.height).unwrap(),
++                NonZeroU32::new(self.window_size.width).unwrap(),
++                NonZeroU32::new(self.window_size.height).unwrap(),
+             )
+             .unwrap();
+         self.paint_last_frame();
+@@ -365,18 +369,15 @@ where
+         };
+ 
+         let mut win_buf = self.surface.as_mut().unwrap().buffer_mut().unwrap();
+-        if win_buf.len() == data_to_blit.len() {
+-            win_buf.copy_from_slice(data_to_blit);
+-        } else {
+-            tracing::warn!(
+-                "buffer size mismatch, skipping paint: {}, {} (content {:?}, scaled {:?}, win {:?})",
+-                win_buf.len(),
+-                data_to_blit.len(),
+-                self.content_size,
+-                self.scaled_size,
+-                self.window_size
+-            );
+-            return None;
++        win_buf.fill(0);
++        let copy_width = self.scaled_size.width.min(self.window_size.width) as usize;
++        let copy_height = self.scaled_size.height.min(self.window_size.height) as usize;
++        let x = self.window_size.width.saturating_sub(self.scaled_size.width) as usize / 2;
++        let y = self.window_size.height.saturating_sub(self.scaled_size.height) as usize / 2;
++        for row in 0..copy_height {
++            let src = row * self.scaled_size.width as usize;
++            let dst = (row + y) * self.window_size.width as usize + x;
++            win_buf[dst..dst + copy_width].copy_from_slice(&data_to_blit[src..src + copy_width]);
+         }
+         win_buf.present().unwrap();
+         Some(())
+@@ -394,8 +395,8 @@ where
+     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+         // Initialize the window.
+         let window_attributes = WinitWindow::default_attributes()
+-            .with_inner_size(self.content_size.to_physical::<u32>(1.0))
+-            .with_title("WIE");
++            .with_inner_size(LogicalSize::new(self.content_size.width * 2, self.content_size.height * 2))
++            .with_title(crate::app_config::TITLE);
+         let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
+         let context = Context::new(window.clone()).unwrap();
+         self.window = Some(window.clone());
+@@ -403,7 +404,7 @@ where
+         self.window_size = window.inner_size();
+ 
+         // After the window is initialized we resize the window again with the correct scale factor.
+-        self.update_scale_factor(Some(window.scale_factor()), Some(1.0));
++        self.update_scale_factor(Some(window.scale_factor()), Some(window.scale_factor()));
+         if let Some(new_size) = window.request_inner_size(self.scaled_size) {
+             self.window_size = new_size;
+         }
+@@ -441,6 +442,7 @@ where
+     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+         match event {
+             WindowEvent::CloseRequested => event_loop.exit(),
++            WindowEvent::Focused(false) => self.callback(WindowCallbackEvent::FocusLost, event_loop),
+             WindowEvent::KeyboardInput {
+                 event:
+                     KeyEvent {
+@@ -464,6 +466,9 @@ where
+             WindowEvent::Resized(new_size) => {
+                 tracing::debug!("WindowResized {new_size:?}");
+                 self.window_size = new_size;
++                if new_size.width == 0 || new_size.height == 0 {
++                    return;
++                }
+                 if self.window_size != self.scaled_size {
+                     // Determine the new scale factor.
+                     let wscale = self.window_size.width as f64 / self.content_size.width as f64;
+diff --git a/wie-lgt/src/runtime/stdlib.rs b/wie-lgt/src/runtime/stdlib.rs
+index e1fa591..88fdc44 100644
+--- a/wie-lgt/src/runtime/stdlib.rs
++++ b/wie-lgt/src/runtime/stdlib.rs
+@@ -23,7 +23,7 @@ pub fn register_stdlib_svc_handler(core: &mut ArmCore, system: &System) -> Resul
+             x if x == StdlibSvcId::Strncpy as u32 => EmulatedFunction::call(&strncpy, core, &mut ()).await?.write(core, lr),
+             x if x == StdlibSvcId::Strcat as u32 => EmulatedFunction::call(&strcat, core, &mut ()).await?.write(core, lr),
+             x if x == StdlibSvcId::Strcmp as u32 => EmulatedFunction::call(&strcmp, core, &mut ()).await?.write(core, lr),
+-            x if x == StdlibSvcId::Unk4 as u32 => EmulatedFunction::call(&unk4, core, &mut ()).await?.write(core, lr),
++            x if x == StdlibSvcId::Strncmp as u32 => (EmulatedFunction::call(&strncmp, core, &mut ()).await? as u32).write(core, lr),
+             x if x == StdlibSvcId::Strstr as u32 => EmulatedFunction::call(&strstr, core, &mut ()).await?.write(core, lr),
+             x if x == StdlibSvcId::Strlen as u32 => EmulatedFunction::call(&stdlib::strlen, core, &mut ()).await?.write(core, lr),
+             x if x == StdlibSvcId::Memcpy as u32 => EmulatedFunction::call(&stdlib::memcpy, core, &mut ()).await?.write(core, lr),
+@@ -164,10 +164,17 @@ async fn unk3(core: &mut ArmCore, _: &mut (), a0: u32) -> Result<()> {
+     Ok(())
+ }
+ 
+-async fn unk4(_core: &mut ArmCore, _: &mut (), a0: u32, a1: u32, a2: u32, a3: u32) -> Result<()> {
+-    tracing::warn!("unk4({a0:#x}, {a1:#x}, {a2:#x}, {a3:#x})");
+-
+-    Ok(())
++// LGT import 0x40a is the bounded C string comparison. Guest callers use
++// its zero result to match persistent record names (and its sign for ordering).
++async fn strncmp(core: &mut ArmCore, _: &mut (), lhs: u32, rhs: u32, count: u32) -> Result<i32> {
++    for offset in 0..count {
++        let left: u8 = read_generic(core, lhs.wrapping_add(offset))?;
++        let right: u8 = read_generic(core, rhs.wrapping_add(offset))?;
++        if left != right || left == 0 {
++            return Ok(i32::from(left) - i32::from(right));
++        }
++    }
++    Ok(0)
+ }
+ 
+ async fn strstr(core: &mut ArmCore, _: &mut (), ptr_haystack: u32, ptr_needle: u32) -> Result<u32> {
+@@ -195,7 +202,25 @@ mod tests {
+     use wie_core_arm::ArmCore;
+     use wie_util::Result;
+ 
+-    use super::{rand, srand};
++    use super::{rand, srand, strncmp};
++
++    #[test]
++    fn bounded_compare_handles_empty_prefix_nul_unsigned_and_errors() -> Result<()> {
++        let mut core = ArmCore::new(false, None)?;
++        assert_eq!(strncmp(&mut core, &mut (), 0, 0, 0).now_or_never().unwrap()?, 0);
++        core.load(b"slot_2\0x", 0x10000, 0x1000)?;
++        core.load(b"slot_2\0y", 0x11000, 0x1000)?;
++        assert_eq!(strncmp(&mut core, &mut (), 0x10000, 0x11000, 8).now_or_never().unwrap()?, 0);
++        core.load(b"slot_3\0", 0x12000, 0x1000)?;
++        assert_eq!(strncmp(&mut core, &mut (), 0x10000, 0x12000, 5).now_or_never().unwrap()?, 0);
++        assert!(strncmp(&mut core, &mut (), 0x10000, 0x12000, 6).now_or_never().unwrap()? < 0);
++        assert!(strncmp(&mut core, &mut (), 0x12000, 0x10000, 6).now_or_never().unwrap()? > 0);
++        core.load(&[0x80, 0], 0x13000, 0x1000)?;
++        core.load(&[0x7f, 0], 0x14000, 0x1000)?;
++        assert_eq!(strncmp(&mut core, &mut (), 0x13000, 0x14000, 1).now_or_never().unwrap()?, 1);
++        assert!(strncmp(&mut core, &mut (), 0xffff0000, 0x14000, 1).now_or_never().unwrap().is_err());
++        Ok(())
++    }
+ 
+     #[test]
+     fn random_state_is_shared_by_system_clones_and_process_local() -> Result<()> {
+diff --git a/wie-lgt/src/runtime/svc_ids.rs b/wie-lgt/src/runtime/svc_ids.rs
+index 0f4da5b..6f96e42 100644
+--- a/wie-lgt/src/runtime/svc_ids.rs
++++ b/wie-lgt/src/runtime/svc_ids.rs
+@@ -356,7 +356,7 @@ pub enum StdlibSvcId {
+     Strncpy = 0x406,
+     Strcat = 0x407,
+     Strcmp = 0x409,
+-    Unk4 = 0x40a,
++    Strncmp = 0x40a,
+     Strstr = 0x410,
+     Strlen = 0x411,
+     Memcpy = 0x414,

@@ -1,0 +1,7 @@
+/build/
+/dist/
+*.apk
+*.zip
+*.app/
+__pycache__/
+.DS_Store
