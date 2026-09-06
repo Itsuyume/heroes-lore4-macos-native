@@ -19,7 +19,12 @@ def main() -> None:
     run("git", "checkout", "--detach", REVISION, cwd=SOURCE)
     run("git", "apply", str(ROOT / "patches" / "macos-native.patch"), cwd=SOURCE)
     run("cargo", "fmt", "--check", cwd=SOURCE)
-    run("cargo", "test", "-p", "wie", "-p", "wie-lgt", cwd=SOURCE)
+    run("cargo", "test", "-p", "wie", "-p", "wie-backend", "-p", "wie-lgt", cwd=SOURCE)
+    probe = SOURCE.parent / "synth-render-test"
+    run("clang", "-Wall", "-Wextra", "-Werror", str(ROOT / "tests" / "synth_render.c"),
+        "-I", str(SOURCE / "src"), "-framework", "AudioToolbox", "-framework", "AudioUnit",
+        "-framework", "CoreServices", "-o", str(probe))
+    run(str(probe))
     run("cargo", "clippy", "--workspace", cwd=SOURCE)
     run("cargo", "build", "--release", "--locked", "-p", "wie", cwd=SOURCE)
 

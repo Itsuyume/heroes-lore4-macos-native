@@ -6,7 +6,7 @@ WIE의 Rust 데스크톱 실행부를 Apple Silicon용으로 빌드하고, 사�
 
 ## 경계
 
-- `patches/macos-native.patch`: 번들 상대 경로, 저장 디렉터리, 네이티브 창 크기와 검은 여백, 포커스 해제 시 키 해제, macOS 내장 MIDI 합성기 연결, LGT 표준 문자열 비교 구현.
+- `patches/macos-native.patch`: 번들 상대 경로, 저장 디렉터리, 네이티브 창 크기와 검은 여백, 포커스 해제 시 키 해제, macOS 내장 MIDI 합성기와 효과음을 단일 오디오 출력에 연결, 유휴 CPU 대기, LGT 표준 문자열 비교 구현.
 - `build.py`: WIE의 고정 리비전 체크아웃 및 패치·검증·컴파일.
 - `package.py`: 로컬 게임 ZIP과 실행 파일을 `.app`으로 패키징하고 임시 서명 검증.
 - 게임 엔진·CPU·그래픽 API 구현은 WIE에 유지한다.

@@ -97,7 +97,7 @@ index 0000000..d1b2049
 +    }
 +}
 diff --git a/src/audio_sink.rs b/src/audio_sink.rs
-index 0e09bc7..5c4b5c7 100644
+index 0e09bc7..7bc712e 100644
 --- a/src/audio_sink.rs
 +++ b/src/audio_sink.rs
 @@ -1,17 +1,14 @@
@@ -119,7 +119,7 @@ index 0e09bc7..5c4b5c7 100644
  pub struct AudioSink {
      tx: Sender<AudioCommand>,
  }
-@@ -62,23 +59,7 @@ impl Playback {
+@@ -62,34 +59,17 @@ impl Playback {
  }
  
  pub fn run(rx: Receiver<AudioCommand>, midi_device: Option<usize>) {
@@ -140,11 +140,27 @@ index 0e09bc7..5c4b5c7 100644
 -        tracing::info!(port = %port_name, "Using MIDI output");
 -        Ok::<_, Box<dyn Error>>(connection)
 -    })() {
-+    let mut midi_out = match crate::midi_output::open(midi_device) {
-         Ok(connection) => Some(connection),
+-        Ok(connection) => Some(connection),
++    let output_sink = match DeviceSinkBuilder::open_default_sink() {
++        Ok(output_sink) => Some(output_sink),
          Err(error) => {
-             tracing::warn!(%error, "MIDI output is unavailable");
-@@ -167,7 +148,7 @@ pub fn run(rx: Receiver<AudioCommand>, midi_device: Option<usize>) {
+-            tracing::warn!(%error, "MIDI output is unavailable");
++            tracing::warn!(%error, "PCM output is unavailable");
+             None
+         }
+     };
+-
+-    let output_sink = match DeviceSinkBuilder::open_default_sink() {
+-        Ok(output_sink) => Some(output_sink),
++    let mut midi_out = match crate::midi_output::open(midi_device, output_sink.as_ref().map(|sink| sink.mixer())) {
++        Ok(connection) => Some(connection),
+         Err(error) => {
+-            tracing::warn!(%error, "PCM output is unavailable");
++            tracing::warn!(%error, "MIDI output is unavailable");
+             None
+         }
+     };
+@@ -167,7 +147,7 @@ pub fn run(rx: Receiver<AudioCommand>, midi_device: Option<usize>) {
  }
  
  fn play_event(
@@ -153,7 +169,7 @@ index 0e09bc7..5c4b5c7 100644
      player: Option<&Player>,
      event: &TimedAudioEvent,
      active_notes: &mut BTreeSet<(u8, u8)>,
-@@ -221,7 +202,7 @@ fn play_event(
+@@ -221,7 +201,7 @@ fn play_event(
      }
  }
  
@@ -213,49 +229,64 @@ index 708174a..17ed341 100644
      fn path_for(&self, aid: &str, path: &str) -> Option<PathBuf> {
 diff --git a/src/macos_synth.c b/src/macos_synth.c
 new file mode 100644
-index 0000000..204760f
+index 0000000..6316940
 --- /dev/null
 +++ b/src/macos_synth.c
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,96 @@
 +#include <AudioToolbox/AudioToolbox.h>
-+#include <stdlib.h>
 +#include <CoreServices/CoreServices.h>
++#include <stdbool.h>
++#include <stdlib.h>
 +
-+typedef struct { AUGraph graph; AudioUnit synth; } HLSynth;
++enum { HL_SAMPLE_RATE = 48000, HL_CHANNELS = 2, HL_MAX_FRAMES = 4096 };
++
++typedef struct {
++    AudioUnit synth;
++    Float64 sample_time;
++    bool initialized;
++    Float32 channels[HL_CHANNELS][HL_MAX_FRAMES];
++} HLSynth;
 +
 +void hl_synth_close(HLSynth *state) {
 +    if (!state) return;
-+    if (state->graph) {
-+        AUGraphStop(state->graph);
-+        DisposeAUGraph(state->graph);
++    if (state->synth) {
++        if (state->initialized) AudioUnitUninitialize(state->synth);
++        AudioComponentInstanceDispose(state->synth);
 +    }
 +    free(state);
 +}
 +
 +OSStatus hl_synth_open(HLSynth **result) {
++    if (!result) return paramErr;
++    *result = NULL;
++    AudioComponentDescription description = { kAudioUnitType_MusicDevice,
++        kAudioUnitSubType_DLSSynth, kAudioUnitManufacturer_Apple, 0, 0 };
++    AudioComponent component = AudioComponentFindNext(NULL, &description);
++    if (!component) return kAudio_ParamError;
 +    HLSynth *state = calloc(1, sizeof(*state));
 +    if (!state) return memFullErr;
-+    AUNode synth_node, output_node;
-+    AudioComponentDescription synth = { kAudioUnitType_MusicDevice,
-+        kAudioUnitSubType_DLSSynth, kAudioUnitManufacturer_Apple, 0, 0 };
-+    AudioComponentDescription output = { kAudioUnitType_Output,
-+        kAudioUnitSubType_DefaultOutput, kAudioUnitManufacturer_Apple, 0, 0 };
-+    OSStatus status = NewAUGraph(&state->graph);
++    OSStatus status = AudioComponentInstanceNew(component, &state->synth);
 +    if (status) goto fail;
-+    status = AUGraphAddNode(state->graph, &synth, &synth_node);
++    AudioStreamBasicDescription format = {
++        .mSampleRate = HL_SAMPLE_RATE,
++        .mFormatID = kAudioFormatLinearPCM,
++        .mFormatFlags = kAudioFormatFlagsNativeFloatPacked | kAudioFormatFlagIsNonInterleaved,
++        .mBytesPerPacket = sizeof(Float32),
++        .mFramesPerPacket = 1,
++        .mBytesPerFrame = sizeof(Float32),
++        .mChannelsPerFrame = HL_CHANNELS,
++        .mBitsPerChannel = 8 * sizeof(Float32),
++    };
++    status = AudioUnitSetProperty(state->synth, kAudioUnitProperty_StreamFormat,
++        kAudioUnitScope_Output, 0, &format, sizeof(format));
 +    if (status) goto fail;
-+    status = AUGraphAddNode(state->graph, &output, &output_node);
++    UInt32 max_frames = HL_MAX_FRAMES;
++    status = AudioUnitSetProperty(state->synth, kAudioUnitProperty_MaximumFramesPerSlice,
++        kAudioUnitScope_Global, 0, &max_frames, sizeof(max_frames));
 +    if (status) goto fail;
-+    status = AUGraphOpen(state->graph);
++    status = AudioUnitInitialize(state->synth);
 +    if (status) goto fail;
-+    status = AUGraphNodeInfo(state->graph, synth_node, NULL, &state->synth);
-+    if (status) goto fail;
-+    status = AUGraphConnectNodeInput(state->graph, synth_node, 0, output_node, 0);
-+    if (status) goto fail;
-+    status = AUGraphInitialize(state->graph);
-+    if (status) goto fail;
-+    status = AUGraphStart(state->graph);
-+    if (status) goto fail;
++    state->initialized = true;
 +    *result = state;
 +    return noErr;
 +fail:
@@ -264,11 +295,39 @@ index 0000000..204760f
 +}
 +
 +OSStatus hl_synth_send(HLSynth *state, const unsigned char *bytes, unsigned int len) {
-+    if (!len) return paramErr;
++    if (!state || !bytes || !len) return paramErr;
 +    if (bytes[0] == 0xF0) return MusicDeviceSysEx(state->synth, bytes, len);
 +    if (len > 3) return paramErr;
 +    return MusicDeviceMIDIEvent(state->synth, bytes[0], len > 1 ? bytes[1] : 0,
 +        len > 2 ? bytes[2] : 0, 0);
++}
++
++// The caller serializes MIDI events and rendering, and owns frames * 2 floats.
++OSStatus hl_synth_render(HLSynth *state, float *interleaved_stereo, unsigned int frames) {
++    if (!state || frames > HL_MAX_FRAMES) return paramErr;
++    if (!frames) return noErr;
++    if (!interleaved_stereo) return paramErr;
++    struct { UInt32 count; AudioBuffer buffers[HL_CHANNELS]; } output = {
++        .count = HL_CHANNELS,
++        .buffers = {
++            {1, frames * sizeof(Float32), state->channels[0]},
++            {1, frames * sizeof(Float32), state->channels[1]},
++        },
++    };
++    AudioTimeStamp timestamp = {
++        .mSampleTime = state->sample_time,
++        .mFlags = kAudioTimeStampSampleTimeValid,
++    };
++    AudioUnitRenderActionFlags flags = 0;
++    OSStatus status = AudioUnitRender(state->synth, &flags, &timestamp, 0, frames,
++        (AudioBufferList *)&output);
++    if (status) return status;
++    for (unsigned int frame = 0; frame < frames; ++frame) {
++        interleaved_stereo[frame * HL_CHANNELS] = state->channels[0][frame];
++        interleaved_stereo[frame * HL_CHANNELS + 1] = state->channels[1][frame];
++    }
++    state->sample_time += frames;
++    return noErr;
 +}
 diff --git a/src/main.rs b/src/main.rs
 index cffb34f..b2eb324 100644
@@ -308,10 +367,10 @@ index cffb34f..b2eb324 100644
                  if let Some(keycode) = convert_key(x) {
 diff --git a/src/midi_output.rs b/src/midi_output.rs
 new file mode 100644
-index 0000000..258394d
+index 0000000..84be134
 --- /dev/null
 +++ b/src/midi_output.rs
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,36 @@
 +use midir::{MidiOutput, MidiOutputConnection};
 +
 +pub enum MidiConnection {
@@ -330,10 +389,12 @@ index 0000000..258394d
 +    }
 +}
 +
-+pub fn open(requested: Option<usize>) -> anyhow::Result<MidiConnection> {
++pub fn open(requested: Option<usize>, _mixer: Option<&rodio::mixer::Mixer>) -> anyhow::Result<MidiConnection> {
 +    #[cfg(target_os = "macos")]
 +    if requested.is_none() {
++        let mixer = _mixer.ok_or_else(|| anyhow::anyhow!("PCM output required for the built-in synthesizer"))?;
 +        let synth = macos::Synth::new()?;
++        mixer.add(synth.source());
 +        tracing::info!("Using macOS built-in DLS synthesizer");
 +        return Ok(MidiConnection::Builtin(synth));
 +    }
@@ -345,43 +406,192 @@ index 0000000..258394d
 +}
 +
 +#[cfg(target_os = "macos")]
-+mod macos {
-+    use std::{ffi::c_void, ptr::NonNull};
-+    unsafe extern "C" {
-+        fn hl_synth_open(result: *mut *mut c_void) -> i32;
-+        fn hl_synth_close(state: *mut c_void);
-+        fn hl_synth_send(state: *mut c_void, bytes: *const u8, len: u32) -> i32;
++mod macos;
+diff --git a/src/midi_output/macos.rs b/src/midi_output/macos.rs
+new file mode 100644
+index 0000000..99a396c
+--- /dev/null
++++ b/src/midi_output/macos.rs
+@@ -0,0 +1,152 @@
++use std::{
++    ffi::c_void,
++    num::NonZero,
++    ptr::NonNull,
++    sync::{Arc, Mutex},
++    time::Duration,
++};
++
++use rodio::Source;
++
++const CHANNELS: u16 = 2;
++const SAMPLE_RATE: u32 = 48_000;
++const BUFFER_SAMPLES: usize = 512;
++
++unsafe extern "C" {
++    fn hl_synth_open(result: *mut *mut c_void) -> i32;
++    fn hl_synth_close(state: *mut c_void);
++    fn hl_synth_send(state: *mut c_void, bytes: *const u8, len: u32) -> i32;
++    fn hl_synth_render(state: *mut c_void, samples: *mut f32, frames: u32) -> i32;
++}
++
++struct Instrument(NonNull<c_void>);
++// All access, including rendering and MIDI delivery, is serialized by Synth's mutex.
++unsafe impl Send for Instrument {}
++impl Drop for Instrument {
++    fn drop(&mut self) {
++        // The last Arc owns the unique C allocation after rendering has stopped.
++        unsafe { hl_synth_close(self.0.as_ptr()) };
 +    }
-+    pub struct Synth(NonNull<c_void>);
-+    impl Synth {
-+        pub fn new() -> anyhow::Result<Self> {
-+            let mut ptr = std::ptr::null_mut();
-+            // The C constructor transfers ownership only after successful initialization.
-+            let status = unsafe { hl_synth_open(&mut ptr) };
-+            anyhow::ensure!(status == 0, "macOS synthesizer initialization failed: {status}");
-+            Ok(Self(NonNull::new(ptr).ok_or_else(|| anyhow::anyhow!("Synthesizer returned null"))?))
-+        }
-+        pub fn send(&mut self, data: &[u8]) -> anyhow::Result<()> {
-+            anyhow::ensure!(!data.is_empty(), "Empty MIDI message");
-+            let len = u32::try_from(data.len())?;
-+            // Both buffers remain valid for the synchronous C call.
-+            let status = unsafe { hl_synth_send(self.0.as_ptr(), data.as_ptr(), len) };
-+            anyhow::ensure!(status == 0, "macOS MIDI event failed: {status}");
-+            Ok(())
++}
++
++#[derive(Clone)]
++pub struct Synth(Arc<Mutex<Instrument>>);
++impl Synth {
++    pub fn new() -> anyhow::Result<Self> {
++        let mut ptr = std::ptr::null_mut();
++        // The C constructor transfers ownership only on success.
++        let status = unsafe { hl_synth_open(&mut ptr) };
++        anyhow::ensure!(status == 0, "macOS synthesizer initialization failed: {status}");
++        let instrument = Instrument(NonNull::new(ptr).ok_or_else(|| anyhow::anyhow!("Synthesizer returned null"))?);
++        Ok(Self(Arc::new(Mutex::new(instrument))))
++    }
++
++    pub fn send(&mut self, data: &[u8]) -> anyhow::Result<()> {
++        anyhow::ensure!(!data.is_empty(), "Empty MIDI message");
++        let len = u32::try_from(data.len())?;
++        let instrument = self.0.lock().map_err(|_| anyhow::anyhow!("Synthesizer lock poisoned"))?;
++        // Both buffers stay valid for the synchronous call under the render lock.
++        let status = unsafe { hl_synth_send(instrument.0.as_ptr(), data.as_ptr(), len) };
++        anyhow::ensure!(status == 0, "macOS MIDI event failed: {status}");
++        Ok(())
++    }
++
++    pub fn source(&self) -> SynthSource {
++        SynthSource {
++            synth: self.clone(),
++            samples: [0.0; BUFFER_SAMPLES],
++            offset: BUFFER_SAMPLES,
++            failed: false,
 +        }
 +    }
-+    impl Drop for Synth {
-+        fn drop(&mut self) {
-+            // This is the unique owner of the graph allocated by hl_synth_open.
-+            unsafe { hl_synth_close(self.0.as_ptr()) };
++
++    fn render(&self, samples: &mut [f32; BUFFER_SAMPLES]) -> anyhow::Result<()> {
++        let instrument = self.0.lock().map_err(|_| anyhow::anyhow!("Synthesizer lock poisoned"))?;
++        // The interleaved stereo array holds exactly the requested frame count.
++        let status = unsafe { hl_synth_render(instrument.0.as_ptr(), samples.as_mut_ptr(), (BUFFER_SAMPLES / CHANNELS as usize) as u32) };
++        anyhow::ensure!(status == 0, "macOS synthesizer render failed: {status}");
++        Ok(())
++    }
++}
++
++pub struct SynthSource {
++    synth: Synth,
++    samples: [f32; BUFFER_SAMPLES],
++    offset: usize,
++    failed: bool,
++}
++impl Iterator for SynthSource {
++    type Item = f32;
++    fn next(&mut self) -> Option<Self::Item> {
++        if self.failed {
++            return None;
 +        }
++        if self.offset == self.samples.len() {
++            if let Err(error) = self.synth.render(&mut self.samples) {
++                tracing::error!(%error, "Stopping failed MIDI renderer");
++                self.failed = true;
++                return None;
++            }
++            self.offset = 0;
++        }
++        let sample = self.samples[self.offset];
++        self.offset += 1;
++        Some(sample)
++    }
++}
++impl Source for SynthSource {
++    fn current_span_len(&self) -> Option<usize> {
++        None
++    }
++    fn channels(&self) -> NonZero<u16> {
++        NonZero::new(CHANNELS).unwrap()
++    }
++    fn sample_rate(&self) -> NonZero<u32> {
++        NonZero::new(SAMPLE_RATE).unwrap()
++    }
++    fn total_duration(&self) -> Option<Duration> {
++        None
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::Synth;
++
++    #[test]
++    fn idle_rendering_then_midi_note_produces_audio() {
++        let mut synth = Synth::new().unwrap();
++        let mut source = synth.source();
++        for _ in 0..480_000 {
++            assert!(source.next().unwrap().abs() < 0.000001);
++        }
++        assert!(synth.send(&[]).is_err());
++        synth.send(&[0xc0, 0]).unwrap();
++        synth.send(&[0xb0, 7, 100]).unwrap();
++        synth.send(&[0x90, 60, 100]).unwrap();
++        let peak = source.by_ref().take(48_000).map(f32::abs).fold(0.0, f32::max);
++        assert!(peak > 0.001, "silent synth after five seconds of idle audio: {peak}");
++        synth.send(&[0x80, 60, 0]).unwrap();
++    }
++
++    #[test]
++    fn pcm_effects_and_midi_share_output_after_idle() {
++        use rodio::{Player, buffer::SamplesBuffer, mixer::mixer};
++        use std::num::NonZero;
++        let channels = NonZero::new(2).unwrap();
++        let rate = NonZero::new(48_000).unwrap();
++        let (input, mut output) = mixer(channels, rate);
++        let mut synth = Synth::new().unwrap();
++        input.add(synth.source());
++        let player = Player::connect_new(&input);
++        for _ in 0..480_000 {
++            assert!(output.next().unwrap().abs() < 0.000001);
++        }
++        synth.send(&[0x90, 60, 100]).unwrap();
++        player.append(SamplesBuffer::new(channels, rate, vec![0.75; 512]));
++        let effect_peak = output.by_ref().take(1024).map(f32::abs).fold(0.0, f32::max);
++        assert!(effect_peak > 0.6, "PCM effect did not reach shared output");
++        let music_peak = output.by_ref().take(48_000).map(f32::abs).fold(0.0, f32::max);
++        assert!(music_peak > 0.001, "MIDI did not continue after PCM effect ended");
 +    }
 +}
 diff --git a/src/window.rs b/src/window.rs
-index 83bca2e..efc6a38 100644
+index 83bca2e..9c1cfd7 100644
 --- a/src/window.rs
 +++ b/src/window.rs
-@@ -53,6 +53,7 @@ pub enum WindowCallbackEvent {
+@@ -1,6 +1,11 @@
+ use alloc::sync::Arc;
+ use core::{fmt::Debug, fmt::Formatter, num::NonZeroU32};
+-use std::{fmt, sync::RwLock, vec};
++use std::{
++    fmt,
++    sync::RwLock,
++    time::{Duration, Instant},
++    vec,
++};
+ 
+ use fast_image_resize::ResizeAlg;
+ use fast_image_resize::{PixelType, ResizeOptions, SrcCropping};
+@@ -16,6 +21,8 @@ use winit::{
+ 
+ use wie_backend::{Screen, canvas::Image};
+ 
++const UPDATE_REST: Duration = Duration::from_millis(8);
++
+ const MAX_DISPLAY_DIMENSION: u32 = 4096;
+ const MAX_DISPLAY_PIXELS: u32 = 4 * 1024 * 1024;
+ 
+@@ -53,6 +60,7 @@ pub enum WindowCallbackEvent {
      Redraw,
      Keydown(PhysicalKey),
      Keyup(PhysicalKey),
@@ -389,7 +599,32 @@ index 83bca2e..efc6a38 100644
  }
  
  pub struct WindowHandle {
-@@ -321,6 +322,9 @@ where
+@@ -139,7 +147,7 @@ impl WindowImpl {
+     where
+         C: FnMut(WindowCallbackEvent) -> wie_util::Result<()> + 'static,
+     {
+-        self.event_loop.set_control_flow(ControlFlow::Poll);
++        self.event_loop.set_control_flow(ControlFlow::Wait);
+ 
+         const DEFAULT_USER_SCALE_FACTOR: f64 = 1.0;
+         let (width, height) = read_display_size(&self.display_size);
+@@ -157,6 +165,7 @@ impl WindowImpl {
+             surface: None,
+             callback: Box::new(callback),
+             last_frame: vec![0u32; (width * height) as usize],
++            next_update: Instant::now(),
+         };
+ 
+         Ok(self.event_loop.run_app(&mut handler)?)
+@@ -263,6 +272,7 @@ where
+     context: Option<Context<Arc<WinitWindow>>>,
+     surface: Option<Surface<Arc<WinitWindow>, Arc<WinitWindow>>>,
+     callback: Box<C>,
++    next_update: Instant,
+ }
+ 
+ impl<C> ApplicationHandlerImpl<C>
+@@ -321,6 +331,9 @@ where
  
      /// Updates the scaled content image surface's size.
      fn on_resize(&mut self) {
@@ -399,7 +634,7 @@ index 83bca2e..efc6a38 100644
          tracing::info!(
              "on_resize scale=(native {}, actual {}), content={:?}, scaled={:?}, window={:?}",
              self.native_scale_factor,
-@@ -335,7 +339,7 @@ where
+@@ -335,7 +348,7 @@ where
                  self.surface.as_mut().unwrap()
              }
              Some(surface) => {
@@ -408,7 +643,7 @@ index 83bca2e..efc6a38 100644
                  if surface.buffer_mut().unwrap().len() == desired_len as usize {
                      // nothing to do
                      return;
-@@ -346,8 +350,8 @@ where
+@@ -346,8 +359,8 @@ where
  
          surface
              .resize(
@@ -419,7 +654,7 @@ index 83bca2e..efc6a38 100644
              )
              .unwrap();
          self.paint_last_frame();
-@@ -365,18 +369,15 @@ where
+@@ -365,18 +378,15 @@ where
          };
  
          let mut win_buf = self.surface.as_mut().unwrap().buffer_mut().unwrap();
@@ -447,7 +682,24 @@ index 83bca2e..efc6a38 100644
          }
          win_buf.present().unwrap();
          Some(())
-@@ -394,8 +395,8 @@ where
+@@ -388,14 +398,24 @@ where
+     C: FnMut(WindowCallbackEvent) -> wie_util::Result<()> + 'static,
+ {
+     fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: StartCause) {
+-        self.callback(WindowCallbackEvent::Update, event_loop)
++        if Instant::now() < self.next_update {
++            return;
++        }
++        self.callback(WindowCallbackEvent::Update, event_loop);
++        // Sleep even when emulation exhausts its time slice; queued paint/input
++        // events must not trigger another emulation slice before this deadline.
++        self.next_update = Instant::now() + UPDATE_REST;
++    }
++
++    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
++        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_update));
+     }
+ 
      fn resumed(&mut self, event_loop: &ActiveEventLoop) {
          // Initialize the window.
          let window_attributes = WinitWindow::default_attributes()
@@ -458,7 +710,7 @@ index 83bca2e..efc6a38 100644
          let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
          let context = Context::new(window.clone()).unwrap();
          self.window = Some(window.clone());
-@@ -403,7 +404,7 @@ where
+@@ -403,7 +423,7 @@ where
          self.window_size = window.inner_size();
  
          // After the window is initialized we resize the window again with the correct scale factor.
@@ -467,7 +719,7 @@ index 83bca2e..efc6a38 100644
          if let Some(new_size) = window.request_inner_size(self.scaled_size) {
              self.window_size = new_size;
          }
-@@ -441,6 +442,7 @@ where
+@@ -441,6 +461,7 @@ where
      fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
          match event {
              WindowEvent::CloseRequested => event_loop.exit(),
@@ -475,7 +727,7 @@ index 83bca2e..efc6a38 100644
              WindowEvent::KeyboardInput {
                  event:
                      KeyEvent {
-@@ -464,6 +466,9 @@ where
+@@ -464,6 +485,9 @@ where
              WindowEvent::Resized(new_size) => {
                  tracing::debug!("WindowResized {new_size:?}");
                  self.window_size = new_size;
@@ -485,6 +737,108 @@ index 83bca2e..efc6a38 100644
                  if self.window_size != self.scaled_size {
                      // Determine the new scale factor.
                      let wscale = self.window_size.width as f64 / self.content_size.width as f64;
+diff --git a/wie-backend/src/executor.rs b/wie-backend/src/executor.rs
+index 8605f4a..d649b4b 100644
+--- a/wie-backend/src/executor.rs
++++ b/wie-backend/src/executor.rs
+@@ -118,6 +118,9 @@ impl Executor {
+ 
+             {
+                 let inner = self.inner.lock();
++                if inner.tasks.is_empty() {
++                    break;
++                }
+                 let running_task_count = inner.tasks.len() - inner.sleeping_tasks.len();
+                 if running_task_count == 0 && !inner.sleeping_tasks.is_empty() {
+                     let next_wakeup = *inner.sleeping_tasks.values().min().unwrap();
+@@ -211,9 +214,9 @@ mod tests {
+     use alloc::sync::Arc;
+     use core::{
+         cell::Cell,
+-        future::Future,
++        future::{Future, poll_fn},
+         pin::Pin,
+-        sync::atomic::{AtomicBool, Ordering},
++        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+         task::{Context, Poll},
+     };
+ 
+@@ -246,6 +249,75 @@ mod tests {
+         }
+     }
+ 
++    fn tick_clock_calls(executor: &mut Executor, start: u64) -> usize {
++        let clock = advancing_clock(start);
++        let calls = Cell::new(0);
++        executor
++            .tick(|| {
++                calls.set(calls.get() + 1);
++                clock()
++            })
++            .unwrap();
++        calls.get()
++    }
++
++    #[test]
++    fn test_empty_executor_returns_without_consuming_time_slice() {
++        assert_eq!(tick_clock_calls(&mut Executor::new(), 0), 2);
++    }
++
++    #[test]
++    fn test_last_completed_task_returns_without_consuming_time_slice() {
++        let mut executor = Executor::new();
++        let completed = Arc::new(AtomicBool::new(false));
++        let completed_clone = completed.clone();
++        executor.spawn(move || async move {
++            completed_clone.store(true, Ordering::Relaxed);
++        });
++
++        assert_eq!(tick_clock_calls(&mut executor, 0), 3);
++        assert!(completed.load(Ordering::Relaxed));
++        assert_eq!(tick_clock_calls(&mut executor, 100), 2);
++    }
++
++    #[test]
++    fn test_sleeping_task_resumes_only_at_deadline() {
++        let mut executor = Executor::new();
++        let completed = Arc::new(AtomicBool::new(false));
++        let completed_clone = completed.clone();
++        let executor_clone = executor.clone();
++        executor.spawn(move || async move {
++            executor_clone.sleep(20);
++            YieldOnce(false).await;
++            completed_clone.store(true, Ordering::Relaxed);
++        });
++
++        assert_eq!(tick_clock_calls(&mut executor, 0), 3);
++        assert_eq!(tick_clock_calls(&mut executor, 19), 2);
++        assert!(!completed.load(Ordering::Relaxed));
++        assert_eq!(tick_clock_calls(&mut executor, 20), 3);
++        assert!(completed.load(Ordering::Relaxed));
++    }
++
++    #[test]
++    fn test_runnable_task_keeps_full_time_slice() {
++        let mut executor = Executor::new();
++        let polls = Arc::new(AtomicUsize::new(0));
++        let polls_clone = polls.clone();
++        executor.spawn(move || async move {
++            poll_fn(move |_| {
++                polls_clone.fetch_add(1, Ordering::Relaxed);
++                Poll::<()>::Pending
++            })
++            .await;
++        });
++
++        assert_eq!(tick_clock_calls(&mut executor, 0), 10);
++        assert_eq!(polls.load(Ordering::Relaxed), 8);
++        assert_eq!(tick_clock_calls(&mut executor, 100), 10);
++        assert_eq!(polls.load(Ordering::Relaxed), 16);
++    }
++
+     #[test]
+     fn test_failed_task_preserves_others() {
+         let mut executor = Executor::new();
 diff --git a/wie-lgt/src/runtime/stdlib.rs b/wie-lgt/src/runtime/stdlib.rs
 index e1fa591..88fdc44 100644
 --- a/wie-lgt/src/runtime/stdlib.rs
